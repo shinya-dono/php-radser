@@ -1,0 +1,33 @@
+includes:
+    - vendor/phpstan/phpstan-strict-rules/rules.neon
+
+parameters:
+
+    level: 8
+    checkDynamicProperties: true
+    checkBenevolentUnionTypes: true
+    reportNonIntStringArrayKey: true
+    reportIgnoresWithoutComments: true
+    reportAnyTypeWideningInVarTag: true
+    reportAlwaysTrueInLastCondition: true
+    checkStrictPrintfPlaceholderTypes: true
+    checkMissingOverrideMethodAttribute: true
+    reportUnsafeArrayStringKeyCasting: prevent
+    rememberPossiblyImpureFunctionValues: false
+    checkMissingOverridePropertyAttribute: false
+    reportPossiblyNonexistentGeneralArrayOffset: true
+    reportPossiblyNonexistentConstantArrayOffset: true
+    checkTooWideThrowTypesInProtectedAndPublicMethods: true
+    checkTooWideReturnTypesInProtectedAndPublicMethods: true
+    checkTooWideParameterOutInProtectedAndPublicMethods: true
+
+    exceptions:
+        check:
+            missingCheckedExceptionInThrows: true
+
+    strictRules:
+        booleansInConditions: false
+        booleansInLoopConditions: false
+
+    paths:
+        - src

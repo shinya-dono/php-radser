@@ -1,0 +1,16 @@
+# Every file here is text; normalise to LF in the repository whatever the
+# checkout platform does locally.
+* text=auto eol=lf
+
+# Keep development-only files out of the archive Composer installs. They stay
+# in the repository - this only trims what `composer require` unpacks into a
+# consumer's vendor/ directory.
+/.gitattributes         export-ignore
+/.gitignore             export-ignore
+/.php-cs-fixer.dist.php export-ignore
+/composer.lock          export-ignore
+/dictionaries/          export-ignore
+/phpstan.neon           export-ignore
+/phpunit.xml            export-ignore
+/rector.php             export-ignore
+/tests/                 export-ignore

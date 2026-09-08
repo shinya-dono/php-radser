@@ -1,0 +1,50 @@
+{
+  "name": "shinya-dono/php-radser",
+  "description": "A RADIUS server toolkit for PHP, built on ReactPHP",
+  "type": "library",
+  "keywords": ["radius", "radius-server", "aaa", "reactphp", "rfc2865", "rfc2866", "rfc5176", "coa", "accounting"],
+  "license": "MIT",
+  "minimum-stability": "stable",
+  "prefer-stable": true,
+  "authors": [
+    {
+      "name": "shinya",
+      "email": "admin@shinya-dono.com"
+    }
+  ],
+  "scripts": {
+    "cs": [
+      "rector --no-progress-bar",
+      "php-cs-fixer fix -q"
+    ],
+    "analyze": [
+      "phpstan analyze --no-progress"
+    ],
+    "test": [
+      "phpunit"
+    ]
+  },
+  "require": {
+    "php": "^8.5",
+    "ext-bcmath": "*",
+    "react/datagram": "^1.10",
+    "react/promise": "^3.2",
+    "react/event-loop": "^1.5"
+  },
+  "require-dev": {
+    "rector/rector": "^2.6",
+    "phpunit/phpunit": "^13.3",
+    "friendsofphp/php-cs-fixer": "^3.95",
+    "phpstan/phpstan-strict-rules": "^2.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Shinya\\PhpRadser\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Shinya\\PhpRadser\\Tests\\": "tests/"
+    }
+  }
+}
