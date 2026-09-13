@@ -4,7 +4,12 @@ declare(strict_types = 1);
 
 namespace Shinya\PhpRadser\Tests;
 
+use Shinya\PhpRadser\Peer;
+use Shinya\PhpRadser\PacketCode;
+use Shinya\PhpRadser\Support\PacketCodec;
+use Shinya\PhpRadser\Contracts\AccessRequest;
 use PHPUnit\Framework\Attributes\CoversNothing;
+use Shinya\PhpRadser\Rfc2865\Attributes\UserName;
 
 /**
  * drives the real server process with the system radclient binary: actual UDP, actual
@@ -55,6 +60,40 @@ final class E2eRadiusClientTest extends TestCase
 	}
 
 	/**
+	 * radclient turns a plaintext CHAP-Password into the RFC 1994 hash over its own authenticator.
+	 */
+	public function testChapRequestIsAccepted(): void
+	{
+		$output = $this->radiusCommand(self::AUTH_PORT, 'auth', "User-Name = alice\nCHAP-Password = hunter2\nNAS-IP-Address = 127.0.0.1\n");
+
+		$this->assertStringContainsString('Access-Accept', $output);
+	}
+
+	public function testChapRequestWithWrongPasswordIsRejected(): void
+	{
+		$output = $this->radiusCommand(self::AUTH_PORT, 'auth', "User-Name = alice\nCHAP-Password = wrong\nNAS-IP-Address = 127.0.0.1\n");
+
+		$this->assertStringContainsString('Access-Reject', $output);
+	}
+
+	/**
+	 * radclient builds an MS-CHAP-Challenge and an MS-CHAPv1 response out of MS-CHAP-Password.
+	 */
+	public function testMsChapV1RequestIsAccepted(): void
+	{
+		$output = $this->radiusCommand(self::AUTH_PORT, 'auth', "User-Name = alice\nMS-CHAP-Password = hunter2\nNAS-IP-Address = 127.0.0.1\n");
+
+		$this->assertStringContainsString('Access-Accept', $output);
+	}
+
+	public function testMsChapV1RequestWithWrongPasswordIsRejected(): void
+	{
+		$output = $this->radiusCommand(self::AUTH_PORT, 'auth', "User-Name = alice\nMS-CHAP-Password = wrong\nNAS-IP-Address = 127.0.0.1\n");
+
+		$this->assertStringContainsString('Access-Reject', $output);
+	}
+
+	/**
 	 * a handler that throws costs the packet that triggered it and nothing else - otherwise any
 	 * registered NAS could stop the service with one request - and the server hands what it
 	 * caught to the errorHandler it was built with.
@@ -75,11 +114,7 @@ final class E2eRadiusClientTest extends TestCase
 	 */
 	public function testAnUnmatchedReplyIsReportedAndDropped(): void
 	{
-		$socket = stream_socket_client(sprintf('udp://127.0.0.1:%d', self::AUTH_PORT));
-		$this->assertIsResource($socket);
-
-		fwrite($socket, pack('CCn', 44, 99, 20).str_repeat("\0", 16)); // CoA-Ack, identifier 99
-		fclose($socket);
+		$this->sendRaw(pack('CCn', 44, 99, 20).str_repeat("\0", 16)); // CoA-Ack, identifier 99
 
 		$output = $this->radiusCommand(self::AUTH_PORT, 'auth', "User-Name = alice\nUser-Password = hunter2\nNAS-IP-Address = 127.0.0.1\n");
 
@@ -102,6 +137,44 @@ final class E2eRadiusClientTest extends TestCase
 
 		$this->assertStringContainsString('No reply', (string) $output);
 		$this->assertStringContainsString('not signed with our shared secret', (string) file_get_contents((string) $this->errorLog));
+	}
+
+	/**
+	 * BlastRADIUS (CVE-2024-3596): the reply carries a Message-Authenticator, and radclient checks
+	 * it against the secret before printing the reply at all.
+	 */
+	public function testAccessReplyCarriesAMessageAuthenticator(): void
+	{
+		$output = $this->radiusCommand(self::AUTH_PORT, 'auth', "User-Name = alice\nUser-Password = hunter2\nNAS-IP-Address = 127.0.0.1\n");
+
+		$this->assertStringContainsString('Access-Accept', $output);
+		$this->assertStringContainsString('Message-Authenticator', $output);
+	}
+
+	public function testAccessRequestWithAForgedMessageAuthenticatorIsDropped(): void
+	{
+		$raw = $this->encodedAccessRequest();
+		$raw = substr_replace($raw, $raw[22] ^ "\x01", 22, 1);
+		$this->sendRaw($raw);
+
+		$output = $this->radiusCommand(self::AUTH_PORT, 'auth', "User-Name = alice\nUser-Password = hunter2\nNAS-IP-Address = 127.0.0.1\n");
+
+		$this->assertStringContainsString('Access-Accept', $output); // and the server is still up
+		$this->assertStringContainsString('not signed with our shared secret', (string) file_get_contents((string) $this->errorLog));
+	}
+
+	/**
+	 * the e2e server's peer requires a Message-Authenticator, so a request stripped of it is dropped.
+	 */
+	public function testAccessRequestWithoutAMessageAuthenticatorIsDropped(): void
+	{
+		$raw = substr_replace($this->encodedAccessRequest(), '', 20, 18);
+		$this->sendRaw(substr_replace($raw, pack('n', strlen($raw)), 2, 2));
+
+		$output = $this->radiusCommand(self::AUTH_PORT, 'auth', "User-Name = alice\nUser-Password = hunter2\nNAS-IP-Address = 127.0.0.1\n");
+
+		$this->assertStringContainsString('Access-Accept', $output);
+		$this->assertStringContainsString('carries no Message-Authenticator', (string) file_get_contents((string) $this->errorLog));
 	}
 
 	public function testAccountingRequestIsAcknowledged(): void
@@ -167,6 +240,26 @@ final class E2eRadiusClientTest extends TestCase
 		);
 
 		return (string) shell_exec($command);
+	}
+
+	/**
+	 * built by our own codec, so it goes out with a valid Message-Authenticator as its first
+	 * attribute, at bytes 20-37 - for the tests that tamper with it.
+	 */
+	private function encodedAccessRequest(): string
+	{
+		$accessRequest = new AccessRequest(new Peer('127.0.0.1', self::SECRET), PacketCode::AccessRequest)->push(UserName::make('mallory'));
+
+		return new PacketCodec()->encode($accessRequest, 200);
+	}
+
+	private function sendRaw(string $bytes): void
+	{
+		$socket = stream_socket_client(sprintf('udp://127.0.0.1:%d', self::AUTH_PORT));
+		$this->assertIsResource($socket);
+
+		fwrite($socket, $bytes);
+		fclose($socket);
 	}
 
 	private function waitForPort(int $port): void

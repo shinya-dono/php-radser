@@ -15,7 +15,8 @@ class InvalidAuthenticatorException extends RadiusRuntimeException
 {
 	public function __construct(
 		public readonly Message $packet,
+		string $problem = 'is not signed with our shared secret',
 	) {
-		parent::__construct(sprintf('%s from peer %s for identifier %d is not signed with our shared secret', $packet->describe(), $packet->getPeer()->ip, $packet->getIdentifier()));
+		parent::__construct(sprintf('%s from peer %s for identifier %d %s', $packet->describe(), $packet->getPeer()->ip, $packet->getIdentifier(), $problem));
 	}
 }

@@ -14,6 +14,7 @@ use Shinya\PhpRadser\Contracts\AccessRequest;
 use Shinya\PhpRadser\Contracts\VendorAttribute;
 use Shinya\PhpRadser\Contracts\EncryptedAttribute;
 use Shinya\PhpRadser\Exceptions\RadiusRuntimeException;
+use Shinya\PhpRadser\Rfc2869\Attributes\MessageAuthenticator;
 
 /**
  * wire framing for a full RADIUS packet: 20-byte header, attribute TLV walk (including
@@ -94,7 +95,8 @@ class PacketCodec
 	 * recompute the authenticator the way the message itself says it is built and compare it to
 	 * what actually arrived. For an Accounting/CoA/Disconnect request that is MD5(header + 16
 	 * zero bytes + attributes + secret); an Access-Request signs nothing and so passes by
-	 * construction - {@see AccessRequest}.
+	 * construction - {@see AccessRequest}. A Message-Authenticator, if the packet carries one, has
+	 * to verify as well; that is the only thing in an Access-Request that can fail.
 	 *
 	 * @throws RadiusRuntimeException
 	 */
@@ -105,7 +107,7 @@ class PacketCodec
 		return hash_equals(
 			known_string: $message->signedAuthenticator($header, $attributeBytes),
 			user_string: substr($raw, 4, 16),
-		);
+		) && $this->verifyMessageAuthenticator($header, $attributeBytes, $message->authenticatorSeed(), $message->getPeer());
 	}
 
 	/**
@@ -136,14 +138,23 @@ class PacketCodec
 		// asked for once and memoised on the message: an Access-Request's seed is random, and the
 		// hidden attributes and the header have to be built around the same 16 bytes
 		$seed = $message->authenticatorSeed();
+		$carriesMessageAuthenticator = $message->carriesMessageAuthenticator();
 
-		$attributeBytes = $this->encodeAttributes($message->pushedAttributes(), $message->getPeer(), $seed);
+		// zeroed while the HMAC is taken (RFC 3579 3.2), and first so no attacker-influenced bytes
+		// sit ahead of it in the MD5 stream - that ordering is the BlastRADIUS (CVE-2024-3596) fix
+		$attributeBytes = ($carriesMessageAuthenticator ? pack('CC', MessageAuthenticator::type(), 18).self::ZERO_AUTHENTICATOR : '')
+			.$this->encodeAttributes($message->pushedAttributes(), $message->getPeer(), $seed);
 		$length = self::HEADER_LENGTH + strlen($attributeBytes);
 		if ($length > self::MAX_LENGTH) {
 			throw new RadiusRuntimeException(sprintf('encoded RADIUS packet of %d bytes exceeds the %d-byte maximum', $length, self::MAX_LENGTH));
 		}
 
 		$header = pack('CCn', $message->getPacketCode(), $identifier, $length);
+
+		if ($carriesMessageAuthenticator) {
+			// over the seed, not the final authenticator - which is then signed over this value
+			$attributeBytes = substr_replace($attributeBytes, $message->getPeer()->messageAuthenticator($header.$seed.$attributeBytes), 2, 16);
+		}
 
 		return $header.$message->signedAuthenticator($header, $attributeBytes).$attributeBytes;
 	}
@@ -158,7 +169,32 @@ class PacketCodec
 		return hash_equals(
 			known_string: $peer->sign($header.$authenticatorSeed.$attributeBytes),
 			user_string: substr($raw, 4, 16),
-		);
+		) && $this->verifyMessageAuthenticator($header, $attributeBytes, $authenticatorSeed, $peer);
+	}
+
+	/**
+	 * RFC 3579 3.2: HMAC-MD5 over the packet with $seed in the authenticator field and the
+	 * Message-Authenticator's own value zeroed. A packet without one passes - whether one is
+	 * required is the peer's policy ({@see Peer::$requireMessageAuthenticator}), not the codec's.
+	 */
+	protected function verifyMessageAuthenticator(string $header, string $attributeBytes, string $seed, Peer $peer): bool
+	{
+		$length = strlen($attributeBytes);
+
+		// a bare TLV walk: split() only vouches for the header, and a length octet under 2 would
+		// otherwise never move the offset along
+		for ($offset = 0; $offset + 2 <= $length; $offset += max(2, ord($attributeBytes[$offset + 1]))) {
+			if (MessageAuthenticator::type() !== ord($attributeBytes[$offset])) {
+				continue;
+			}
+
+			return 18 === ord($attributeBytes[$offset + 1]) && hash_equals(
+				known_string: $peer->messageAuthenticator($header.$seed.substr_replace($attributeBytes, self::ZERO_AUTHENTICATOR, $offset + 2, 16)),
+				user_string: substr($attributeBytes, $offset + 2, 16),
+			);
+		}
+
+		return true;
 	}
 
 	/**
@@ -261,6 +297,10 @@ class PacketCodec
 		$raw = '';
 
 		foreach ($attributes as $attribute) {
+			if ($attribute instanceof MessageAuthenticator) {
+				continue; // encode() computes its own over the finished packet
+			}
+
 			if ($attribute instanceof EncryptedAttribute) {
 				$attribute->setPeer($peer);
 				$attribute->setAuthenticator($authenticatorSeed);

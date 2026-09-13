@@ -5,6 +5,7 @@ declare(strict_types = 1);
 namespace Shinya\PhpRadser\Contracts;
 
 use Shinya\PhpRadser\Peer;
+use Shinya\PhpRadser\PacketCode;
 use Shinya\PhpRadser\Support\PacketCodec;
 
 /**
@@ -102,6 +103,16 @@ class Message
 	public function signedAuthenticator(string $header, string $attributeBytes): string
 	{
 		return $this->peer->sign($header.$this->authenticatorSeed().$attributeBytes);
+	}
+
+	/**
+	 * whether PacketCodec puts a Message-Authenticator (RFC 3579 3.2) on this packet when it goes
+	 * out: every code except accounting, which RFC 2869 5.19 forbids it on. Override to opt a
+	 * code of your own out.
+	 */
+	public function carriesMessageAuthenticator(): bool
+	{
+		return !in_array($this->packetCode, [PacketCode::AccountingRequest, PacketCode::AccountingResponse], strict: true);
 	}
 
 	/**

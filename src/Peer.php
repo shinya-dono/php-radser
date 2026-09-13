@@ -27,12 +27,17 @@ class Peer
 	 * @param string $ip the peer's source address, which is what selects it on an inbound packet
 	 * @param string $secret the secret shared with this peer
 	 * @param int $port the port the peer listens on for the requests we start - CoA, Disconnect, PoD
+	 * @param bool $requireMessageAuthenticator drop an Access-Request from this peer that carries no
+	 *                                          Message-Authenticator - the BlastRADIUS
+	 *                                          (CVE-2024-3596) mitigation; off by default because
+	 *                                          older NASes never send one
 	 */
 	public function __construct(
 		public readonly string $ip,
 		#[SensitiveParameter]
 		protected readonly string $secret,
 		public readonly int $port = 3799,
+		public readonly bool $requireMessageAuthenticator = false,
 	) {
 		$this->address = static::endpoint($this->ip, $this->port);
 		$this->coaAddress = $this->address;
@@ -66,6 +71,15 @@ class Peer
 	public function sign(string $content): string
 	{
 		return md5($content.$this->secret, binary: true);
+	}
+
+	/**
+	 * RFC 3579 3.2: a Message-Authenticator is HMAC-MD5 over the packet, keyed on the shared
+	 * secret; $packet already has the attribute's own value zeroed.
+	 */
+	public function messageAuthenticator(string $packet): string
+	{
+		return hash_hmac('md5', $packet, $this->secret, binary: true);
 	}
 
 	/**

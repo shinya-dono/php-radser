@@ -15,6 +15,7 @@ use Shinya\PhpRadser\Rfc2865\Attributes\UserName;
 use Shinya\PhpRadser\Rfc2865\Attributes\ReplyMessage;
 use Shinya\PhpRadser\Rfc2865\Attributes\UserPassword;
 use Shinya\PhpRadser\Exceptions\RadiusRuntimeException;
+use Shinya\PhpRadser\Rfc2869\Attributes\MessageAuthenticator;
 use Shinya\PhpRadser\Vendors\Mikrotik\Attributes\MikrotikRateLimit;
 
 /**
@@ -76,9 +77,10 @@ final class PacketCodecTest extends TestCase
 
 		$this->assertNotSame(substr($first, 4, 16), substr($second, 4, 16));
 
-		// unverifiable by design: there is nothing in the packet the nonce is derived from, so
-		// the check has nothing to disagree with and passes whatever the secret
-		$this->assertTrue($packetCodec->verifyRequestAuthenticator($first, $packetCodec->decode($first, new Peer('10.0.0.1', 'wrong'))));
+		// the nonce itself is unverifiable by design; what makes the packet checkable at all is the
+		// Message-Authenticator the codec puts on it
+		$this->assertTrue($packetCodec->verifyRequestAuthenticator($first, $packetCodec->decode($first, $peer)));
+		$this->assertFalse($packetCodec->verifyRequestAuthenticator($first, $packetCodec->decode($first, new Peer('10.0.0.1', 'wrong'))));
 	}
 
 	/**
@@ -149,5 +151,75 @@ final class PacketCodecTest extends TestCase
 		$message = $packetCodec->decode($packetCodec->encode(new AccessRequest($peer, 200), 7), $peer);
 
 		$this->assertInstanceOf(AccessRequest::class, $message);
+	}
+
+	/**
+	 * BlastRADIUS (CVE-2024-3596): an Access-Accept carries a Message-Authenticator as its first
+	 * attribute, taken over the request's authenticator the way RFC 3579 3.2 specifies.
+	 */
+	public function testAccessReplyCarriesAMessageAuthenticatorFirst(): void
+	{
+		$packetCodec = new PacketCodec();
+		$peer = new Peer('10.0.0.1', 'secret');
+
+		$message = $packetCodec->decode($packetCodec->encode(new AccessRequest($peer, PacketCode::AccessRequest), 7), $peer);
+		$raw = $packetCodec->encode($message->reply(PacketCode::AccessAccept)->push(ReplyMessage::make('welcome')), 7);
+
+		$this->assertSame(MessageAuthenticator::type(), ord($raw[20]));
+		$this->assertSame(18, ord($raw[21]));
+
+		// recomputed by hand: the request's authenticator in the header, the value itself zeroed
+		$zeroed = substr_replace($raw, PacketCodec::ZERO_AUTHENTICATOR, 22, 16);
+		$this->assertSame(hash_hmac('md5', substr($zeroed, 0, 4).$message->getAuthenticator().substr($zeroed, 20), 'secret', binary: true), substr($raw, 22, 16));
+	}
+
+	/**
+	 * a forged Message-Authenticator fails even when the packet's authenticator has been re-signed
+	 * over it - otherwise the HMAC would add nothing the MD5 did not already.
+	 */
+	public function testAForgedMessageAuthenticatorFailsVerification(): void
+	{
+		$packetCodec = new PacketCodec();
+		$peer = new Peer('10.0.0.1', 'secret');
+
+		$request = $packetCodec->encode(new AccessRequest($peer, PacketCode::AccessRequest)->push(UserName::make('alice')), 7);
+		$reply = $packetCodec->encode($packetCodec->decode($request, $peer)->reply(PacketCode::AccessReject), 7);
+		$this->assertTrue($packetCodec->verifyReplyAuthenticator($reply, substr($request, 4, 16), $peer));
+
+		$request = substr_replace($request, $request[22] ^ "\x01", 22, 1);
+		$this->assertFalse($packetCodec->verifyRequestAuthenticator($request, $packetCodec->decode($request, $peer)));
+
+		$reply = substr_replace($reply, $reply[22] ^ "\x01", 22, 1);
+		$reply = substr_replace($reply, $peer->sign(substr($reply, 0, 4).substr($request, 4, 16).substr($reply, 20)), 4, 16);
+		$this->assertFalse($packetCodec->verifyReplyAuthenticator($reply, substr($request, 4, 16), $peer));
+	}
+
+	/**
+	 * RFC 2869 5.19 forbids it on accounting, and one pushed by hand is never sent as-is.
+	 */
+	public function testAccountingCarriesNoMessageAuthenticator(): void
+	{
+		$packetCodec = new PacketCodec();
+		$peer = new Peer('10.0.0.1', 'secret');
+
+		$message = new Message($peer, PacketCode::AccountingRequest)->push(MessageAuthenticator::make(str_repeat('x', 16)));
+
+		$this->assertFalse($packetCodec->decode($packetCodec->encode($message, 7), $peer)->has(MessageAuthenticator::class));
+	}
+
+	/**
+	 * RFC 5176 3.3: on a CoA/Disconnect-Request the HMAC is taken with 16 zero bytes in the
+	 * authenticator field - the same seed the request authenticator itself is built over.
+	 */
+	public function testCoaRequestMessageAuthenticatorIsTakenOverTheZeroSeed(): void
+	{
+		$packetCodec = new PacketCodec();
+		$peer = new Peer('10.0.0.1', 'secret');
+
+		$raw = $packetCodec->encode(new Message($peer, PacketCode::CoaRequest)->push(UserName::make('alice')), 7);
+
+		$zeroed = substr_replace($raw, PacketCodec::ZERO_AUTHENTICATOR, 22, 16);
+		$this->assertSame(hash_hmac('md5', substr($zeroed, 0, 4).PacketCodec::ZERO_AUTHENTICATOR.substr($zeroed, 20), 'secret', binary: true), substr($raw, 22, 16));
+		$this->assertTrue($packetCodec->verifyRequestAuthenticator($raw, $packetCodec->decode($raw, $peer)));
 	}
 }

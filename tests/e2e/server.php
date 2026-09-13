@@ -14,21 +14,27 @@ use Shinya\PhpRadser\Peer;
 use Shinya\PhpRadser\Server;
 use Shinya\PhpRadser\PacketCode;
 use Shinya\PhpRadser\PeerRegistry;
+use Shinya\PhpRadser\Support\Chap;
+use Shinya\PhpRadser\Support\MsChap;
 use Shinya\PhpRadser\Contracts\Channel;
 use Shinya\PhpRadser\Contracts\Handler;
 use Shinya\PhpRadser\Contracts\Message;
 use Shinya\PhpRadser\Support\ServerConfig;
 use Shinya\PhpRadser\Contracts\ErrorHandler;
 use Shinya\PhpRadser\Rfc2865\Attributes\UserName;
+use Shinya\PhpRadser\Rfc2865\Attributes\ChapPassword;
 use Shinya\PhpRadser\Rfc2865\Attributes\ReplyMessage;
 use Shinya\PhpRadser\Rfc2865\Attributes\UserPassword;
+use Shinya\PhpRadser\Vendors\Microsoft\Attributes\MsChapResponse;
 
 require dirname(__DIR__, 2).'/vendor/autoload.php';
 
 [, $authPort, $acctPort, $secret, $lifetime] = $argv;
 
 $registry = new PeerRegistry();
-$registry->register(new Peer('127.0.0.1', $secret));
+// radclient always sends a Message-Authenticator, so requiring one only costs the raw packets the
+// test strips it from
+$registry->register(new Peer('127.0.0.1', $secret, requireMessageAuthenticator: true));
 
 $handler = new class implements Handler
 {
@@ -52,9 +58,13 @@ $handler = new class implements Handler
 		}
 
 		$code = match ($message->getPacketCode()) {
-			PacketCode::AccessRequest     => 'alice' === $message->get(UserName::class)->read() && 'hunter2' === $message->get(UserPassword::class)->getPlainText()
-				? PacketCode::AccessAccept
-				: PacketCode::AccessReject,
+			PacketCode::AccessRequest     => 'alice' === $message->get(UserName::class)->read() && match (true) {
+				$message->has(ChapPassword::class)   => Chap::verify($message, 'hunter2'),
+				$message->has(MsChapResponse::class) => MsChap::verifyV1($message, MsChap::ntHash('hunter2')),
+				default                              => 'hunter2' === $message->get(UserPassword::class)->getPlainText(),
+			}
+			? PacketCode::AccessAccept
+			: PacketCode::AccessReject,
 			PacketCode::AccountingRequest => PacketCode::AccountingResponse,
 			default                       => null,
 		};

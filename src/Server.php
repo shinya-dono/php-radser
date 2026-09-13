@@ -14,9 +14,12 @@ use Shinya\PhpRadser\Contracts\Message;
 use Shinya\PhpRadser\Support\PacketCodec;
 use Shinya\PhpRadser\Support\ServerConfig;
 use Shinya\PhpRadser\Contracts\ErrorHandler;
+use Shinya\PhpRadser\Contracts\AccessRequest;
 use Shinya\PhpRadser\Exceptions\RadiusRuntimeException;
 use Shinya\PhpRadser\Exceptions\UnexpectedReplyException;
+use Shinya\PhpRadser\Rfc2869\Attributes\MessageAuthenticator;
 use Shinya\PhpRadser\Exceptions\InvalidAuthenticatorException;
+use Shinya\PhpRadser\Exceptions\MissingMessageAuthenticatorException;
 
 /**
  * the entry point: owns the authentication and accounting sockets, decodes and verifies every
@@ -124,6 +127,7 @@ class Server
 	 * @throws RadiusRuntimeException the datagram isn't a RADIUS packet we can read
 	 * @throws UnexpectedReplyException an answer to a request we aren't waiting on
 	 * @throws InvalidAuthenticatorException a packet not signed with the peer's secret
+	 * @throws MissingMessageAuthenticatorException an Access-Request without the Message-Authenticator its peer requires
 	 */
 	protected function receive(string $data, string $remoteAddress, SocketInterface $socket): void
 	{
@@ -152,6 +156,12 @@ class Server
 			// and says so by signing nothing, so this stays a single unconditional call
 			if (!$this->packetCodec->verifyRequestAuthenticator($data, $message)) {
 				throw new InvalidAuthenticatorException($message);
+			}
+
+			// BlastRADIUS (CVE-2024-3596): without a Message-Authenticator nothing ties an
+			// Access-Request to the secret at all - the peer decides whether that is acceptable
+			if ($message instanceof AccessRequest && $peer->requireMessageAuthenticator && !$message->has(MessageAuthenticator::class)) {
+				throw new MissingMessageAuthenticatorException($message);
 			}
 
 			$this->dispatch($message, $channel);

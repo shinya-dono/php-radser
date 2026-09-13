@@ -27,6 +27,8 @@
   "require": {
     "php": "^8.5",
     "ext-bcmath": "*",
+    "ext-mbstring": "*",
+    "ext-openssl": "*",
     "react/datagram": "^1.10",
     "react/promise": "^3.2",
     "react/event-loop": "^1.5"

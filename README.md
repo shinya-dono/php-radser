@@ -40,6 +40,7 @@ drives a real server process with FreeRADIUS's `radclient` over real UDP.
 - [Gotchas](#gotchas)
 - [Extending and injecting](#extending-and-injecting)
 - [Development](#development)
+- [Upgrade guide](#upgrade-guide)
 - [License](#license)
 
 ---
@@ -51,8 +52,10 @@ drives a real server process with FreeRADIUS's `radclient` over real UDP.
 | **Authentication**             | Access-Request handling, Accept/Reject/Challenge replies                           |
 | **Accounting**                 | Accounting-Request handling on a separate socket, Accounting-Response              |
 | **Dynamic authorization**      | CoA-Request and Disconnect-Request as promises, RFC 5176                           |
-| **Attribute dictionary**       | RFC 2865, RFC 2866, RFC 3576/5176 and Mikrotik, as generated typed classes         |
+| **Attribute dictionary**       | RFC 2865, 2866, 2869, 3576/5176, Microsoft and Mikrotik, as generated typed classes |
 | **Hidden attributes**          | RFC 2865 5.2 password hiding, unwrapped on the way in                              |
+| **CHAP and MS-CHAP**           | CHAP, MS-CHAPv1 and MS-CHAPv2 response checks, MS-CHAP2-Success and error replies  |
+| **Message-Authenticator**      | Added to every non-accounting packet, verified on the way in, BlastRADIUS-safe     |
 | **Authenticator checks**       | Requests and replies verified against the peer's secret before a handler sees them |
 | **Vendor-specific attributes** | Vendor-Specific (26) nesting, encode and decode                                    |
 | **Non-blocking**               | One ReactPHP event loop, no threads, no forking                                    |
@@ -60,6 +63,7 @@ drives a real server process with FreeRADIUS's `radclient` over real UDP.
 ## Requirements
 
 - PHP 8.5 or newer, with `ext-bcmath` (for the 64-bit counters, whose top end a PHP int cannot hold)
+- `ext-mbstring` and `ext-openssl`, for MS-CHAP (the UTF-16 password hash and DES)
 - `react/datagram`, `react/event-loop`, `react/promise` (pulled in by Composer)
 - `radclient` from FreeRADIUS, for the end-to-end tests only
 
@@ -77,7 +81,7 @@ Or point Composer at the repository directly:
         { "type": "vcs", "url": "https://github.com/shinya-dono/php-radser" }
     ],
     "require": {
-        "shinya-dono/php-radser": "^0.0.1"
+        "shinya-dono/php-radser": "^0.2"
     }
 }
 ```
@@ -203,8 +207,9 @@ Received Access-Accept Id 85 from 127.0.0.1:1812 to 127.0.0.1:51521 length 47
         |
         +-- anything else: a request
               |
-              +-- authenticator does not verify -> InvalidAuthenticatorException
-              |   (an Access-Request signs nothing, so it always passes here)
+              +-- authenticator or Message-Authenticator does not verify -> InvalidAuthenticatorException
+              |   (an Access-Request's authenticator is a nonce; only its Message-Authenticator can fail)
+              +-- Access-Request without one, peer requires it -> MissingMessageAuthenticatorException
               |
               v
         Handler::handle($message, $channel, $stopBubbling)   [each handler in turn]
@@ -248,6 +253,22 @@ $registry->register(new Peer('10.0.0.2', 'a-different-secret'));
 // third argument is the port the NAS listens on for CoA/Disconnect, RFC 5176 default 3799
 $registry->register(new Peer('10.0.0.3', 'secret', 1700));
 ```
+
+### Message-Authenticator
+
+Every packet except accounting goes out with a Message-Authenticator (RFC 3579), and a packet that
+arrives carrying one is dropped unless it verifies. On an Access-Accept, Reject or Challenge it is
+the first attribute, which is what defeats BlastRADIUS (CVE-2024-3596).
+
+An Access-Request *without* one is still accepted by default, because older NASes never send it.
+Once yours do, require it per peer:
+
+```php
+$registry->register(new Peer('10.0.0.1', 'secret', requireMessageAuthenticator: true));
+```
+
+A request that arrives without one is then dropped and reported as a
+`MissingMessageAuthenticatorException` — count those in your `ErrorHandler` while you roll it out.
 
 IPv6 peers are normalised, so `::1`, `0:0:0:0:0:0:0:1` and `::0001` are the same registration.
 
@@ -364,6 +385,45 @@ $password = $message->get(UserPassword::class)->getPlainText();  // string|null
 what makes this work. Hydrate a `UserPassword` outside a `Message` and `getPlainText()` returns
 null — there is no key to undo it with.
 
+### CHAP and MS-CHAP
+
+Neither sends the password. The NAS sends proof that the user knows one, and you check that proof
+against what you hold. `Support\Chap` and `Support\MsChap` do the arithmetic; the decision stays
+in your handler.
+
+```php
+use Shinya\PhpRadser\Support\Chap;
+use Shinya\PhpRadser\Support\MsChap;
+use Shinya\PhpRadser\Rfc2865\Attributes\ChapPassword;
+use Shinya\PhpRadser\Vendors\Microsoft\Attributes\MsChapResponse;
+use Shinya\PhpRadser\Vendors\Microsoft\Attributes\MsChap2Response;
+
+$ntHash = MsChap::ntHash($password);   // or the NT hash you stored instead of the password
+
+$accept = $message->reply(PacketCode::AccessAccept);
+$reject = $message->reply(PacketCode::AccessReject);
+
+if ($message->has(MsChap2Response::class)) {
+    $success = MsChap::verifyV2($message, $ntHash);
+
+    $channel->send(null !== $success ? $accept->push($success) : $reject->push(MsChap::error($message)));
+}
+elseif ($message->has(MsChapResponse::class)) {
+    $channel->send(MsChap::verifyV1($message, $ntHash) ? $accept : $reject->push(MsChap::error($message)));
+}
+elseif ($message->has(ChapPassword::class)) {
+    $channel->send(Chap::verify($message, $password) ? $accept : $reject);
+}
+```
+
+- CHAP needs the password in the clear. MS-CHAP only needs its 16-byte NT hash, so if MS-CHAP is
+  all you serve you can store `MsChap::ntHash()` instead of the password.
+- An MS-CHAPv2 Access-Accept **must** carry the `MS-CHAP2-Success` that `verifyV2()` returns.
+  Windows, RouterOS and strongSwan hang up on an Accept without it.
+- `MsChap::error()` builds the `MS-CHAP-Error` for a reject. Pass a Windows error code where 691
+  (bad credentials) says too little: 648 for an expired password, 647 for a disabled account.
+- Not covered: password change (`MS-CHAP-CPW-*`), LM-only responses and MPPE keys.
+
 ### Vendor attributes
 
 Vendor-Specific (26) nesting is unwrapped for you. A vendor attribute is read exactly like a
@@ -478,7 +538,8 @@ Every exception extends `RadiusRuntimeException`, which extends `RuntimeExceptio
 | Exception | Raised when |
 |---|---|
 | `RadiusRuntimeException` | The datagram is not a RADIUS packet we can read, or an encode is impossible |
-| `InvalidAuthenticatorException` | A packet is not signed with the peer's shared secret |
+| `InvalidAuthenticatorException` | A packet is not signed with the peer's shared secret, or its Message-Authenticator does not verify |
+| `MissingMessageAuthenticatorException` | An Access-Request lacks the Message-Authenticator its peer requires; extends `InvalidAuthenticatorException` |
 | `UnexpectedReplyException` | A peer answered a request nobody is waiting on |
 | `RequestTimedOutException` | A `sendAsync()` request went unanswered (rejects the promise) |
 | `InvalidAttributeValueException` | `Attribute::validate()` rejected a value |
@@ -526,11 +587,11 @@ accident. Use `make()` anyway.
 It returns an unfilled attribute whose `read()` is null. `if ($message->get(X::class))` is
 always true. Use `has()`, or check `read()`.
 
-**An Access-Request is not authenticated.**
-RFC 2865 gives it a random nonce rather than a signature, so there is nothing in one to verify —
-this is the protocol, not an omission. Your protection on the auth port is the source-address
-check plus the fact that only someone holding the secret can read your reply. Accounting, CoA and
-all replies *are* verified.
+**An Access-Request is only authenticated by its Message-Authenticator.**
+RFC 2865 gives it a random nonce rather than a signature, so without a Message-Authenticator there
+is nothing in one to verify. One that carries it is verified; one that does not is accepted unless
+its peer sets `requireMessageAuthenticator` — see [Message-Authenticator](#message-authenticator).
+Accounting, CoA and all replies are verified either way.
 
 **Unknown sources vanish silently.**
 A datagram from an IP with no `Peer` registered is dropped without an exception and without
@@ -777,6 +838,88 @@ or kept climbing:
 ```bash
 php tests/e2e/soak.php 50000 500
 ```
+
+## Upgrade guide
+
+A caret constraint on a 0.x version only follows patch releases — `^0.1` will never install 0.2.0 —
+so every minor version is an upgrade you opt into:
+
+```bash
+composer require shinya-dono/php-radser:^0.2
+```
+
+### 0.1.x to 0.2.0
+
+0.2.0 adds [Message-Authenticator](#message-authenticator) handling and
+[CHAP and MS-CHAP](#chap-and-ms-chap). Most servers upgrade without a code change, but what goes on
+the wire is different, and so is what gets dropped.
+
+**Every packet except accounting now goes out with a Message-Authenticator.**
+Access-Accept, Access-Reject and Access-Challenge carry it as their first attribute, which is what
+closes BlastRADIUS (CVE-2024-3596). Access-Requests, CoA and Disconnect requests and their ACK/NAK
+carry it too. 0.1.x never sent one. What to check:
+
+- The attribute has been standard since RFC 2869 (2000) and NASes accept it. If a very old one
+  starts discarding replies after the upgrade, this is why.
+- Every reply is 18 bytes longer. One that was already close to the 4096-byte limit can now make
+  `encode()` throw a `RadiusRuntimeException`.
+- A `MessageAuthenticator` you push yourself is ignored; the codec always computes its own.
+- A request you start with `sendAsync()` can go out without one: build it from a `Message` subclass
+  whose `carriesMessageAuthenticator()` returns false. Replies can be opted out the same way, but
+  only through a custom request class registered in `PacketCodec`, and doing so reopens BlastRADIUS.
+
+**A packet whose Message-Authenticator does not verify is now dropped.**
+0.1.x ignored the attribute on the way in. 0.2.0 checks it whenever it is present, on requests and
+on the CoA/Disconnect answers you are waiting for, and hands an `InvalidAuthenticatorException` to
+your `ErrorHandler` when it does not match. A NAS that sends a correct one sees no difference.
+
+One NAS does notice: one that sends a Message-Authenticator but whose shared secret disagrees with
+yours. On 0.1.x its Access-Requests
+still reached your handler — the password just decrypted to garbage and you rejected it. On 0.2.0
+they are dropped before any handler runs, so the NAS gets no reply and times out. If a NAS "stops
+answering" after the upgrade and your `ErrorHandler` reports `is not signed with our shared secret`,
+fix the secret.
+
+**Requiring a Message-Authenticator is new, and off by default.**
+An Access-Request without one is still accepted, exactly as in 0.1.x. The mitigation is only
+complete once you require it, which you do per peer once that NAS sends one:
+
+```php
+// 0.1.x, and still the 0.2.0 default
+$registry->register(new Peer('10.0.0.1', 'secret'));
+
+// 0.2.0, once this NAS sends a Message-Authenticator
+$registry->register(new Peer('10.0.0.1', 'secret', requireMessageAuthenticator: true));
+```
+
+To find out which NASes already send one before you flip the switch, log it from a handler:
+
+```php
+use Shinya\PhpRadser\Rfc2869\Attributes\MessageAuthenticator;
+
+if (PacketCode::AccessRequest === $message->getPacketCode() && !$message->has(MessageAuthenticator::class)) {
+    error_log('no Message-Authenticator from '.$message->getPeer()->ip);
+}
+```
+
+With the flag on, a request without one is dropped and reported as a
+`MissingMessageAuthenticatorException`. It extends `InvalidAuthenticatorException`, so an
+`ErrorHandler` that already handles that one keeps working.
+
+**Two more PHP extensions are required.**
+`ext-mbstring` and `ext-openssl`, for MS-CHAP. Composer refuses to install 0.2.0 without them; most
+PHP builds ship both.
+
+**If you extend the library's classes:**
+
+- `Peer::__construct()` has a new fourth parameter, `requireMessageAuthenticator`. A subclass that
+  overrides the constructor should accept it and pass it on.
+- `Message` has a new public method, `carriesMessageAuthenticator()`. A subclass that already
+  defines a method with that name now overrides it.
+- `PacketCodec::verifyRequestAuthenticator()` and `PacketCodec::verify()` now also check the
+  Message-Authenticator. An override that does not call the parent skips that check.
+- `InvalidAuthenticatorException::__construct()` takes an optional second argument, the reason
+  shown in its message. Existing calls are unaffected.
 
 ## License
 
